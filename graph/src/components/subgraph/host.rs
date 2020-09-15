@@ -1,3 +1,4 @@
+use std::cmp::PartialEq;
 use std::fmt;
 use std::sync::Arc;
 
@@ -113,7 +114,7 @@ impl HostMetrics {
 }
 
 pub trait RuntimeHostBuilder: Clone + Send + Sync + 'static {
-    type Host: RuntimeHost;
+    type Host: RuntimeHost + PartialEq;
     type Req: 'static + Send;
 
     /// Build a new runtime host for a subgraph data source.
