@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::env;
 use std::str::FromStr;
 
-use graph::components::subgraph::SharedProofOfIndexing;
+use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
 use graph::prelude::{SubgraphInstance as SubgraphInstanceTrait, *};
-use web3::types::Log;
+use web3::types::{Log, H256};
 
 lazy_static! {
     static ref MAX_DATA_SOURCES: Option<usize> = env::var("GRAPH_SUBGRAPH_MAX_DATA_SOURCES")
@@ -71,10 +71,7 @@ where
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(format_err!(
-                "Errors loading data sources: {}",
-                joined_errors
-            ));
+            return Err(anyhow!("Errors loading data sources: {}", joined_errors));
         }
 
         this.hosts = hosts
@@ -90,9 +87,9 @@ where
         &mut self,
         logger: Logger,
         data_source: DataSource,
-        top_level_templates: Arc<Vec<DataSourceTemplate>>,
+        templates: Arc<Vec<DataSourceTemplate>>,
         host_metrics: Arc<HostMetrics>,
-    ) -> Result<T::Host, anyhow::Error> {
+    ) -> Result<T::Host, Error> {
         let mapping_request_sender = {
             let module_bytes = data_source.mapping.runtime.as_ref();
             let module_hash = tiny_keccak::keccak256(module_bytes);
@@ -109,16 +106,14 @@ where
                 sender
             }
         };
-        self.host_builder
-            .build(
-                self.network.clone(),
-                self.subgraph_id.clone(),
-                data_source,
-                top_level_templates,
-                mapping_request_sender,
-                host_metrics,
-            )
-            .compat_err()
+        self.host_builder.build(
+            self.network.clone(),
+            self.subgraph_id.clone(),
+            data_source,
+            templates,
+            mapping_request_sender,
+            host_metrics,
+        )
     }
 }
 
@@ -139,7 +134,7 @@ where
         trigger: EthereumTrigger,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error> {
+    ) -> Result<BlockState, MappingError> {
         Self::process_trigger_in_runtime_hosts(
             logger,
             &self.hosts,
@@ -158,7 +153,7 @@ where
         trigger: EthereumTrigger,
         mut state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error> {
+    ) -> Result<BlockState, MappingError> {
         match trigger {
             EthereumTrigger::Log(log) => {
                 let log = Arc::new(log);
@@ -168,13 +163,27 @@ where
                     .map(Arc::new)
                     .context("Found no transaction for event")?;
                 let matching_hosts = hosts.iter().filter(|host| host.matches_log(&log));
+                let hosts_count = matching_hosts.clone().count();
+
+                if hosts_count > 1 {
+                    info!(
+                        logger,
+                        "{} matching runtime hosts found for log trigger.", hosts_count;
+                        "address" => &log.address.to_string(),
+                        "topic0" => &log.topics.iter().next().unwrap_or(&H256::zero()).to_string(),
+                        "transaction" => log.transaction_hash.unwrap_or(H256::zero()).to_string(),
+                    );
+                }
+
                 // Process the log in each host in the same order the corresponding data
                 // sources appear in the subgraph manifest
                 let transaction = Arc::new(transaction);
-                for host in matching_hosts {
+                for (i, host) in matching_hosts.enumerate() {
+                    let host_context = format!("{}/{}", i + 1, hosts_count);
+                    let logger = logger.new(o!("runtime_host" => host_context));
                     state = host
                         .process_log(
-                            logger,
+                            &logger,
                             block,
                             &transaction,
                             &log,
@@ -192,11 +201,24 @@ where
                     .context("Found no transaction for call")?;
                 let transaction = Arc::new(transaction);
                 let matching_hosts = hosts.iter().filter(|host| host.matches_call(&call));
+                let hosts_count = matching_hosts.clone().count();
 
-                for host in matching_hosts {
+                if hosts_count > 1 {
+                    info!(
+                        logger,
+                        "{} matching runtime hosts found for call trigger.", hosts_count;
+                        "from" => &call.from.to_string(),
+                        "to" => &call.to.to_string(),
+                        "transaction" => &call.transaction_hash.map(|hash| hash.to_string()).unwrap_or("unkown".to_string()),
+                    );
+                }
+
+                for (i, host) in matching_hosts.enumerate() {
+                    let host_context = format!("{}/{}", i + 1, hosts_count);
+                    let logger = logger.new(o!("runtime_host" => host_context));
                     state = host
                         .process_call(
-                            logger,
+                            &logger,
                             block,
                             &transaction,
                             &call,
@@ -210,10 +232,23 @@ where
                 let matching_hosts = hosts
                     .iter()
                     .filter(|host| host.matches_block(&trigger_type, ptr.number));
-                for host in matching_hosts {
+                let hosts_count = matching_hosts.clone().count();
+
+                if hosts_count > 1 {
+                    info!(
+                        logger,
+                        "{} matching runtime hosts found for block trigger.", hosts_count;
+                        "number" => &ptr.number,
+                        "hash" => &ptr.number,
+                    );
+                }
+
+                for (i, host) in matching_hosts.enumerate() {
+                    let host_context = format!("{}/{}", i + 1, hosts_count);
+                    let logger = logger.new(o!("runtime_host" => host_context));
                     state = host
                         .process_block(
-                            logger,
+                            &logger,
                             block,
                             &trigger_type,
                             state,
@@ -230,9 +265,9 @@ where
         &mut self,
         logger: &Logger,
         data_source: DataSource,
-        top_level_templates: Arc<Vec<DataSourceTemplate>>,
+        templates: Arc<Vec<DataSourceTemplate>>,
         metrics: Arc<HostMetrics>,
-    ) -> Result<Arc<T::Host>, anyhow::Error> {
+    ) -> Result<Option<Arc<T::Host>>, Error> {
         // Protect against creating more than the allowed maximum number of data sources
         if let Some(max_data_sources) = *MAX_DATA_SOURCES {
             if self.hosts.len() >= max_data_sources {
@@ -243,13 +278,33 @@ where
             }
         }
 
-        let host = Arc::new(self.new_host(
-            logger.clone(),
-            data_source,
-            top_level_templates,
-            metrics.clone(),
-        )?);
-        self.hosts.push(host.clone());
-        Ok(host)
+        // `hosts` will remain ordered by the creation block.
+        // See also 8f1bca33-d3b7-4035-affc-fd6161a12448.
+        assert!(
+            self.hosts.last().and_then(|h| h.creation_block_number()) <= data_source.creation_block
+        );
+
+        let host =
+            Arc::new(self.new_host(logger.clone(), data_source, templates, metrics.clone())?);
+
+        Ok(if self.hosts.contains(&host) {
+            None
+        } else {
+            self.hosts.push(host.clone());
+            Some(host)
+        })
+    }
+
+    fn revert_data_sources(&mut self, reverted_block: u64) {
+        // `hosts` is ordered by the creation block.
+        // See also 8f1bca33-d3b7-4035-affc-fd6161a12448.
+        while self
+            .hosts
+            .last()
+            .filter(|h| h.creation_block_number() >= Some(reverted_block))
+            .is_some()
+        {
+            self.hosts.pop();
+        }
     }
 }

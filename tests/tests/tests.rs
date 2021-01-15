@@ -41,11 +41,6 @@ fn run_cmd(args: Vec<&str>, cwd: PathBuf) {
 }
 
 fn run_test(test: &str) {
-    // Do not run integration tests for JSONB.
-    if std::env::var("GRAPH_STORAGE_SCHEME") == Ok("json".to_string()) {
-        return;
-    }
-
     let dir = test_dir(&format!("{}{}", "integration-tests/", test));
     let graph = dir.join("node_modules/.bin/graph").clone();
     let graph_node = fs::canonicalize("../target/debug/graph-node").unwrap();
@@ -82,7 +77,9 @@ fn data_source_context() {
     run_test("data-source-context")
 }
 
+// The arweave.net gateway is having issues, hopefully temporary.
 #[test]
+#[ignore]
 fn arweave_and_3box() {
     let _m = TEST_MUTEX.lock();
     run_test("arweave-and-3box")
@@ -116,4 +113,25 @@ fn value_roundtrip() {
 fn big_decimal() {
     let _m = TEST_MUTEX.lock();
     run_test("big-decimal");
+}
+
+#[test]
+fn non_fatal_errors() {
+    let _m = TEST_MUTEX.lock();
+    std::env::set_var("GRAPH_DISABLE_FAIL_FAST", "yesplease");
+    run_test("non-fatal-errors");
+}
+
+#[test]
+fn data_source_revert() {
+    let _m = TEST_MUTEX.lock();
+
+    // Reorg block 1.
+    std::env::set_var(
+        "FAILPOINTS",
+        "test_reorg=return(2);error_on_duplicate_ds=return",
+    );
+    let _env_guard = defer::defer(|| std::env::remove_var("FAILPOINTS"));
+
+    run_test("data-source-revert");
 }

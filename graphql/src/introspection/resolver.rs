@@ -1,6 +1,7 @@
-use graphql_parser::{query as q, schema as s, Pos};
+use graphql_parser::Pos;
 use std::collections::{BTreeMap, HashMap};
 
+use graph::data::graphql::{object, ObjectOrInterface};
 use graph::prelude::*;
 
 use crate::prelude::*;
@@ -295,15 +296,14 @@ fn input_value(
 }
 
 #[derive(Clone)]
-pub struct IntrospectionResolver<'a> {
+pub struct IntrospectionResolver {
     logger: Logger,
-    schema: &'a Schema,
     type_objects: TypeObjectsMap,
     directives: q::Value,
 }
 
-impl<'a> IntrospectionResolver<'a> {
-    pub fn new(logger: &Logger, schema: &'a Schema) -> Self {
+impl IntrospectionResolver {
+    pub fn new(logger: &Logger, schema: &Schema) -> Self {
         let logger = logger.new(o!("component" => "IntrospectionResolver"));
 
         // Generate queryable objects for all types in the schema
@@ -314,7 +314,6 @@ impl<'a> IntrospectionResolver<'a> {
 
         IntrospectionResolver {
             logger,
-            schema,
             type_objects,
             directives,
         }
@@ -347,7 +346,7 @@ impl<'a> IntrospectionResolver<'a> {
 }
 
 /// A GraphQL resolver that can resolve entities, enum values, scalar types and interfaces/unions.
-impl<'a> Resolver for IntrospectionResolver<'a> {
+impl Resolver for IntrospectionResolver {
     // `IntrospectionResolver` is not used as a "top level" resolver,
     // see `fn as_introspection_context`, so this value is irrelevant.
     const CACHEABLE: bool = false;
@@ -366,7 +365,7 @@ impl<'a> Resolver for IntrospectionResolver<'a> {
         field: &q::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&q::Name, q::Value>,
+        _arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         match field.name.as_str() {
             "possibleTypes" => {
@@ -401,7 +400,7 @@ impl<'a> Resolver for IntrospectionResolver<'a> {
         field: &q::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&q::Name, q::Value>,
+        arguments: &HashMap<&String, q::Value>,
     ) -> Result<q::Value, QueryExecutionError> {
         let object = match field.name.as_str() {
             "__schema" => self.schema_object(),

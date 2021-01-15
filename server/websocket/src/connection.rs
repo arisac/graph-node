@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
-use graph::prelude::*;
+use graph::{data::query::QueryTarget, prelude::*};
 
 lazy_static! {
     static ref MAX_OPERATIONS_PER_CONNECTION: Option<usize> =
@@ -171,7 +171,7 @@ pub struct GraphQlConnection<Q, S> {
     logger: Logger,
     graphql_runner: Arc<Q>,
     stream: WebSocketStream<S>,
-    schema: Arc<Schema>,
+    schema: Arc<ApiSchema>,
 }
 
 impl<Q, S> GraphQlConnection<Q, S>
@@ -182,7 +182,7 @@ where
     /// Creates a new GraphQL subscription service.
     pub(crate) fn new(
         logger: &Logger,
-        schema: Arc<Schema>,
+        schema: Arc<ApiSchema>,
         stream: WebSocketStream<S>,
         graphql_runner: Arc<Q>,
     ) -> Self {
@@ -200,7 +200,7 @@ where
         mut msg_sink: mpsc::UnboundedSender<WsMessage>,
         logger: Logger,
         connection_id: String,
-        schema: Arc<Schema>,
+        schema: Arc<ApiSchema>,
         graphql_runner: Arc<Q>,
     ) -> Result<(), WsError> {
         let mut operations = Operations::new(msg_sink.clone());
@@ -263,7 +263,7 @@ where
                     // Parse the GraphQL query document; respond with a GQL_ERROR if
                     // the query is invalid
                     let query = match parse_query(&payload.query) {
-                        Ok(query) => query,
+                        Ok(query) => query.into_static(),
                         Err(e) => {
                             return send_error_string(
                                 &msg_sink,
@@ -298,10 +298,11 @@ where
                     };
 
                     // Construct a subscription
+                    let target = QueryTarget::Deployment(schema.schema.id.clone());
                     let subscription = Subscription {
                         // Subscriptions currently do not benefit from the generational cache
                         // anyways, so don't bother passing a network.
-                        query: Query::new(schema.clone(), query, variables, None),
+                        query: Query::new(query, variables),
                     };
 
                     debug!(logger, "Start operation";
@@ -309,7 +310,6 @@ where
                            "id" => &id);
 
                     // Execute the GraphQL subscription
-                    let graphql_runner = graphql_runner.clone();
                     let error_sink = msg_sink.clone();
                     let result_sink = msg_sink.clone();
                     let result_id = id.clone();
@@ -317,7 +317,9 @@ where
                     let err_connection_id = connection_id.clone();
                     let err_logger = logger.clone();
                     let run_subscription = graphql_runner
-                        .run_subscription(subscription)
+                        .cheap_clone()
+                        .run_subscription(subscription, target)
+                        .compat()
                         .map_err(move |e| {
                             debug!(err_logger, "Subscription error";
                                                "connection" => &err_connection_id,

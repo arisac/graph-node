@@ -1,23 +1,21 @@
 use std::cmp;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::mem;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use graph::components::ethereum::{
     blocks_with_triggers, triggers_in_block, EthereumNetworks, NodeCapabilities,
 };
-use graph::data::subgraph::schema::{
-    SubgraphDeploymentEntity, SubgraphEntity, SubgraphVersionEntity,
-};
 use graph::prelude::{
     BlockStream as BlockStreamTrait, BlockStreamBuilder as BlockStreamBuilderTrait, *,
 };
 
+use fail::fail_point;
+
 lazy_static! {
     /// Maximum number of blocks to request in each chunk.
     static ref MAX_BLOCK_RANGE_SIZE: u64 = std::env::var("GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE")
-        .unwrap_or("1000".into())
+        .unwrap_or("2000".into())
         .parse::<u64>()
         .expect("invalid GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE");
 
@@ -29,32 +27,32 @@ lazy_static! {
 }
 
 enum BlockStreamState {
-    /// The BlockStream is new and has not yet been polled.
+    /// Starting or restarting reconciliation.
     ///
     /// Valid next states: Reconciliation
-    New,
+    BeginReconciliation,
 
     /// The BlockStream is reconciling the subgraph store state with the chain store state.
     ///
-    /// Valid next states: YieldingBlocks, Idle
+    /// Valid next states: YieldingBlocks, Idle, BeginReconciliation (in case of revert)
     Reconciliation(Box<dyn Future<Item = NextBlocks, Error = Error> + Send>),
 
     /// The BlockStream is emitting blocks that must be processed in order to bring the subgraph
     /// store up to date with the chain store.
     ///
-    /// Valid next states: Reconciliation
+    /// Valid next states: BeginReconciliation
     YieldingBlocks(VecDeque<EthereumBlockWithTriggers>),
 
     /// The BlockStream experienced an error and is pausing before attempting to produce
     /// blocks again.
     ///
-    /// Valid next states: Reconciliation
+    /// Valid next states: BeginReconciliation
     RetryAfterDelay(Box<dyn Future<Item = (), Error = Error> + Send>),
 
     /// The BlockStream has reconciled the subgraph store and chain store states.
     /// No more work is needed until a chain head update.
     ///
-    /// Valid next states: Reconciliation
+    /// Valid next states: BeginReconciliation
     Idle,
 
     /// Not a real state, only used when going from one state to another.
@@ -64,8 +62,10 @@ enum BlockStreamState {
 /// A single next step to take in reconciling the state of the subgraph store with the state of the
 /// chain store.
 enum ReconciliationStep {
-    /// Revert the current block pointed at by the subgraph pointer.
-    RevertBlock(EthereumBlockPointer),
+    /// Revert the current block pointed at by the subgraph pointer. The pointer is to the current
+    /// subgraph head, and a single block will be reverted so the new head will be the parent of the
+    /// current one.
+    Revert(EthereumBlockPointer),
 
     /// Move forwards, processing one or more blocks. Second element is the block range size.
     ProcessDescendantBlocks(Vec<EthereumBlockWithTriggers>, u64),
@@ -76,23 +76,6 @@ enum ReconciliationStep {
     /// Subgraph pointer now matches chain head pointer.
     /// Reconciliation is complete.
     Done,
-}
-
-/// The result of performing a single ReconciliationStep.
-enum ReconciliationStepOutcome {
-    /// These blocks must be processed before reconciliation can continue.
-    /// Second element is the block range size.
-    YieldBlocks(Vec<EthereumBlockWithTriggers>, u64),
-
-    /// Continue to the next reconciliation step.
-    MoreSteps,
-
-    /// Subgraph pointer now matches chain head pointer.
-    /// Reconciliation is complete.
-    Done,
-
-    /// A revert was detected and processed.
-    Revert,
 }
 
 struct BlockStreamContext<S, C> {
@@ -111,14 +94,15 @@ struct BlockStreamContext<S, C> {
     metrics: Arc<BlockStreamMetrics>,
     previous_triggers_per_block: f64,
     previous_block_range_size: u64,
+    max_block_range_size: u64,
 }
 
 impl<S, C> Clone for BlockStreamContext<S, C> {
     fn clone(&self) -> Self {
         Self {
-            subgraph_store: self.subgraph_store.clone(),
-            chain_store: self.chain_store.clone(),
-            eth_adapter: self.eth_adapter.clone(),
+            subgraph_store: self.subgraph_store.cheap_clone(),
+            chain_store: self.chain_store.cheap_clone(),
+            eth_adapter: self.eth_adapter.cheap_clone(),
             node_id: self.node_id.clone(),
             subgraph_id: self.subgraph_id.clone(),
             reorg_threshold: self.reorg_threshold,
@@ -131,21 +115,25 @@ impl<S, C> Clone for BlockStreamContext<S, C> {
             metrics: self.metrics.clone(),
             previous_triggers_per_block: self.previous_triggers_per_block,
             previous_block_range_size: self.previous_block_range_size,
+            max_block_range_size: self.max_block_range_size,
         }
     }
 }
 
 pub struct BlockStream<S, C> {
-    state: Mutex<BlockStreamState>,
+    state: BlockStreamState,
     consecutive_err_count: u32,
     chain_head_update_stream: ChainHeadUpdateStream,
     ctx: BlockStreamContext<S, C>,
 }
 
+// This is the same as `ReconciliationStep` but without retries.
 enum NextBlocks {
     /// Blocks and range size
     Blocks(VecDeque<EthereumBlockWithTriggers>, u64),
-    Revert,
+
+    /// Revert the current block pointed at by the subgraph pointer.
+    Revert(EthereumBlockPointer),
     Done,
 }
 
@@ -170,7 +158,7 @@ where
         metrics: Arc<BlockStreamMetrics>,
     ) -> Self {
         BlockStream {
-            state: Mutex::new(BlockStreamState::New),
+            state: BlockStreamState::BeginReconciliation,
             consecutive_err_count: 0,
             chain_head_update_stream: chain_store.chain_head_updates(),
             ctx: BlockStreamContext {
@@ -191,6 +179,7 @@ where
                 // A high number here forces a slow start, with a range of 1.
                 previous_triggers_per_block: 1_000_000.0,
                 previous_block_range_size: 1,
+                max_block_range_size: *MAX_BLOCK_RANGE_SIZE,
             },
         }
     }
@@ -208,30 +197,25 @@ where
         Box::new(future::loop_fn((), move |()| {
             let ctx1 = ctx.clone();
             let ctx2 = ctx.clone();
-            let ctx3 = ctx.clone();
 
-            ctx1.get_next_step()
-                .and_then(move |step| ctx2.do_step(step))
-                // Check outcome.
-                // Exit loop if done or there are blocks to process.
-                .and_then(move |outcome| match outcome {
-                    ReconciliationStepOutcome::YieldBlocks(next_blocks, range_size) => {
-                        Ok(future::Loop::Break(NextBlocks::Blocks(
-                            next_blocks.into_iter().collect(),
-                            range_size,
-                        )))
-                    }
-                    ReconciliationStepOutcome::MoreSteps => Ok(future::Loop::Continue(())),
-                    ReconciliationStepOutcome::Done => {
-                        // Reconciliation is complete, so try to mark subgraph as Synced
-                        ctx3.update_subgraph_synced_status()?;
+            ctx1.get_next_step().and_then(move |outcome| match outcome {
+                ReconciliationStep::ProcessDescendantBlocks(next_blocks, range_size) => {
+                    Ok(future::Loop::Break(NextBlocks::Blocks(
+                        next_blocks.into_iter().collect(),
+                        range_size,
+                    )))
+                }
+                ReconciliationStep::Retry => Ok(future::Loop::Continue(())),
+                ReconciliationStep::Done => {
+                    // Reconciliation is complete, so try to mark subgraph as Synced
+                    ctx2.update_subgraph_synced_status()?;
 
-                        Ok(future::Loop::Break(NextBlocks::Done))
-                    }
-                    ReconciliationStepOutcome::Revert => {
-                        Ok(future::Loop::Break(NextBlocks::Revert))
-                    }
-                })
+                    Ok(future::Loop::Break(NextBlocks::Done))
+                }
+                ReconciliationStep::Revert(block) => {
+                    Ok(future::Loop::Break(NextBlocks::Revert(block)))
+                }
+            })
         }))
     }
 
@@ -242,13 +226,11 @@ where
         let call_filter = self.call_filter.clone();
         let block_filter = self.block_filter.clone();
         let start_blocks = self.start_blocks.clone();
+        let max_block_range_size = self.max_block_range_size;
 
         // Get pointers from database for comparison
         let head_ptr_opt = ctx.chain_store.chain_head_ptr().unwrap();
-        let subgraph_ptr = ctx
-            .subgraph_store
-            .block_ptr(ctx.subgraph_id.clone())
-            .unwrap();
+        let subgraph_ptr = ctx.subgraph_store.block_ptr(&ctx.subgraph_id).unwrap();
 
         // If chain head ptr is not set yet
         if head_ptr_opt.is_none() {
@@ -276,14 +258,14 @@ where
         // Only continue if the subgraph block ptr is behind the head block ptr.
         // subgraph_ptr > head_ptr shouldn't happen, but if it does, it's safest to just stop.
         if let Some(ptr) = subgraph_ptr {
-            self.metrics
-                .blocks_behind
-                .set((head_ptr.number - ptr.number) as f64);
-
             if ptr.number >= head_ptr.number {
                 return Box::new(future::ok(ReconciliationStep::Done))
                     as Box<dyn Future<Item = _, Error = _> + Send>;
             }
+
+            self.metrics
+                .blocks_behind
+                .set((head_ptr.number - ptr.number) as f64);
         }
 
         // Subgraph ptr is behind head ptr.
@@ -349,7 +331,7 @@ where
                                 //
                                 // Note: We can safely unwrap the subgraph ptr here, because
                                 // if it was `None`, `is_on_main_chain` would be true.
-                                return Box::new(future::ok(ReconciliationStep::RevertBlock(
+                                return Box::new(future::ok(ReconciliationStep::Revert(
                                     subgraph_ptr.unwrap(),
                                 )));
                             }
@@ -401,15 +383,15 @@ where
                             //   10000 triggers found, 2 per block, range_size = 1000 / 2 = 500
                             // - Scan 500 blocks:
                             //   1000 triggers found, 2 per block, range_size = 1000 / 2 = 500
-                            let max_range_size =
-                                MAX_BLOCK_RANGE_SIZE.min(ctx.previous_block_range_size * 10);
+                            let range_size_upper_limit =
+                                max_block_range_size.min(ctx.previous_block_range_size * 10);
                             let range_size = if ctx.previous_triggers_per_block == 0.0 {
-                                max_range_size
+                                range_size_upper_limit
                             } else {
                                 (*TARGET_TRIGGERS_PER_BLOCK_RANGE as f64
                                     / ctx.previous_triggers_per_block)
                                     .max(1.0)
-                                    .min(max_range_size as f64)
+                                    .min(range_size_upper_limit as f64)
                                     as u64
                             };
                             let to = cmp::min(from + range_size - 1, to_limit);
@@ -432,10 +414,12 @@ where
                                     call_filter.clone(),
                                     block_filter.clone(),
                                 )
-                                .map(move |blocks| {
+                                .map_ok(move |blocks| {
                                     section.end();
                                     ReconciliationStep::ProcessDescendantBlocks(blocks, range_size)
-                                }),
+                                })
+                                .boxed()
+                                .compat(),
                             )
                         },
                     ),
@@ -466,6 +450,11 @@ where
             let subgraph_ptr =
                 subgraph_ptr.expect("subgraph block pointer should not be `None` here");
 
+            #[cfg(debug_assertions)]
+            if test_reorg(subgraph_ptr) {
+                return Box::new(future::ok(ReconciliationStep::Revert(subgraph_ptr)));
+            }
+
             // Precondition: subgraph_ptr.number < head_ptr.number
             // Walk back to one block short of subgraph_ptr.number
             let offset = head_ptr.number - subgraph_ptr.number - 1;
@@ -491,10 +480,12 @@ where
                         // Note that head_ancestor is a child of subgraph_ptr.
                         let eth_adapter = self.eth_adapter.clone();
 
-                        let block_with_calls = if !self.include_calls_in_blocks {
+                        let block_with_calls = if !self.include_calls_in_blocks
+                            || head_ancestor.transaction_receipts.is_empty()
+                        {
                             Box::new(future::ok(EthereumBlockWithCalls {
                                 ethereum_block: head_ancestor,
-                                calls: None,
+                                calls: vec![],
                             }))
                                 as Box<dyn Future<Item = _, Error = _> + Send>
                         } else {
@@ -508,7 +499,7 @@ where
                                     )
                                     .map(move |calls| EthereumBlockWithCalls {
                                         ethereum_block: head_ancestor,
-                                        calls: Some(calls),
+                                        calls,
                                     }),
                             )
                         };
@@ -537,82 +528,9 @@ where
                         // The subgraph ptr is not on the main chain.
                         // We will need to step back (possibly repeatedly) one block at a time
                         // until we are back on the main chain.
-                        Box::new(future::ok(ReconciliationStep::RevertBlock(subgraph_ptr)))
+                        Box::new(future::ok(ReconciliationStep::Revert(subgraph_ptr)))
                     }
                 }
-            }
-        }
-    }
-
-    /// Perform a reconciliation step.
-    fn do_step(
-        &self,
-        step: ReconciliationStep,
-    ) -> Box<dyn Future<Item = ReconciliationStepOutcome, Error = Error> + Send> {
-        let ctx = self.clone();
-
-        // We now know where to take the subgraph ptr.
-        match step {
-            ReconciliationStep::Retry => Box::new(future::ok(ReconciliationStepOutcome::MoreSteps)),
-            ReconciliationStep::Done => Box::new(future::ok(ReconciliationStepOutcome::Done)),
-            ReconciliationStep::RevertBlock(subgraph_ptr) => {
-                let metrics = self.metrics.clone();
-                let reverted_block_number = subgraph_ptr.number as f64;
-
-                // We would like to move to the parent of the current block.
-                // This means we need to revert this block.
-
-                // First, load the block in order to get the parent hash.
-                Box::new(
-                    self.eth_adapter
-                        .load_blocks(
-                            ctx.logger.clone(),
-                            ctx.chain_store.clone(),
-                            HashSet::from_iter(std::iter::once(subgraph_ptr.hash)),
-                        )
-                        .into_future()
-                        .map_err(|(e, _)| e)
-                        .and_then(move |(block, _)| {
-                            // There will be exactly one item in the stream.
-                            let block = block.unwrap();
-                            debug!(
-                                ctx.logger,
-                                "Reverting block to get back to main chain";
-                                "block_number" => format!("{}", block.number.unwrap()),
-                                "block_hash" => format!("{}", block.hash.unwrap())
-                            );
-
-                            // Produce pointer to parent block (using parent hash).
-                            let parent_ptr = block
-                                .parent_ptr()
-                                .expect("genesis block cannot be reverted");
-
-                            // Revert entity changes from this block, and update subgraph ptr.
-                            future::result(
-                                ctx.subgraph_store
-                                    .revert_block_operations(
-                                        ctx.subgraph_id.clone(),
-                                        subgraph_ptr,
-                                        parent_ptr,
-                                    )
-                                    .map_err(Error::from)
-                                    .map(|()| {
-                                        metrics.reverted_blocks.set(reverted_block_number);
-                                        // At this point, the loop repeats, and we try to move
-                                        // the subgraph ptr another step in the right direction.
-                                        ReconciliationStepOutcome::Revert
-                                    }),
-                            )
-                        }),
-                )
-            }
-            ReconciliationStep::ProcessDescendantBlocks(descendant_blocks, range_size) => {
-                // Advance the subgraph ptr to each of the specified descendants and yield each
-                // block with relevant events.
-                Box::new(future::ok(ReconciliationStepOutcome::YieldBlocks(
-                    descendant_blocks,
-                    range_size,
-                ))) as Box<dyn Future<Item = _, Error = _> + Send>
             }
         }
     }
@@ -621,9 +539,9 @@ where
     /// caught up to the head block pointer.
     fn update_subgraph_synced_status(&self) -> Result<(), Error> {
         let head_ptr_opt = self.chain_store.chain_head_ptr()?;
-        let subgraph_ptr = self.subgraph_store.block_ptr(self.subgraph_id.clone())?;
+        let subgraph_ptr = self.subgraph_store.block_ptr(&self.subgraph_id)?;
 
-        if head_ptr_opt != subgraph_ptr {
+        if head_ptr_opt != subgraph_ptr || head_ptr_opt.is_none() || subgraph_ptr.is_none() {
             // Not synced yet
             Ok(())
         } else {
@@ -632,139 +550,7 @@ where
             // Stop recording time-to-sync metrics.
             self.metrics.stopwatch.disable();
 
-            let mut ops = vec![];
-
-            // Set deployment synced flag
-            ops.extend(SubgraphDeploymentEntity::update_synced_operations(
-                &self.subgraph_id,
-                true,
-            ));
-
-            // Find versions pointing to this deployment
-            let versions = self
-                .subgraph_store
-                .find(SubgraphVersionEntity::query().filter(EntityFilter::Equal(
-                    "deployment".to_owned(),
-                    self.subgraph_id.to_string().into(),
-                )))?;
-            let version_ids = versions
-                .iter()
-                .map(|entity| entity.id().unwrap())
-                .collect::<Vec<_>>();
-            let version_id_values = version_ids.iter().map(Value::from).collect::<Vec<_>>();
-            ops.push(MetadataOperation::AbortUnless {
-                description: "The same subgraph version entities must point to this deployment"
-                    .to_owned(),
-                query: SubgraphVersionEntity::query().filter(EntityFilter::Equal(
-                    "deployment".to_owned(),
-                    self.subgraph_id.to_string().into(),
-                )),
-                entity_ids: version_ids.clone(),
-            });
-
-            // Find subgraphs with one of these versions as pending version
-            let subgraphs_to_update =
-                self.subgraph_store
-                    .find(SubgraphEntity::query().filter(EntityFilter::In(
-                        "pendingVersion".to_owned(),
-                        version_id_values.clone(),
-                    )))?;
-            let subgraph_ids_to_update = subgraphs_to_update
-                .iter()
-                .map(|entity| entity.id().unwrap())
-                .collect();
-            ops.push(MetadataOperation::AbortUnless {
-                description: "The same subgraph entities must have these versions pending"
-                    .to_owned(),
-                query: SubgraphEntity::query().filter(EntityFilter::In(
-                    "pendingVersion".to_owned(),
-                    version_id_values.clone(),
-                )),
-                entity_ids: subgraph_ids_to_update,
-            });
-
-            // The current versions of these subgraphs will no longer be current now that this
-            // deployment is synced (they will be replaced by the pending version)
-            let current_version_ids = subgraphs_to_update
-                .iter()
-                .filter_map(|subgraph| match subgraph.get("currentVersion") {
-                    Some(Value::String(id)) => Some(id.to_owned()),
-                    Some(Value::Null) => None,
-                    Some(_) => panic!("subgraph entity has invalid value type in currentVersion"),
-                    None => None,
-                })
-                .collect::<Vec<_>>();
-            let current_versions = self.subgraph_store.find(
-                SubgraphVersionEntity::query()
-                    .filter(EntityFilter::new_in("id", current_version_ids.clone())),
-            )?;
-
-            // These versions becoming non-current might mean that some assignments are no longer
-            // needed. Get a list of deployment IDs that are affected by marking these versions as
-            // non-current.
-            let subgraph_hashes_affected = current_versions
-                .iter()
-                .map(|version| {
-                    SubgraphDeploymentId::new(
-                        version
-                            .get("deployment")
-                            .unwrap()
-                            .to_owned()
-                            .as_string()
-                            .unwrap(),
-                    )
-                    .unwrap()
-                })
-                .collect::<HashSet<_>>();
-
-            // Read version summaries for these subgraph hashes
-            let (versions_before, read_summary_ops) = self
-                .subgraph_store
-                .read_subgraph_version_summaries(subgraph_hashes_affected.into_iter().collect())?;
-            ops.extend(read_summary_ops);
-
-            // Simulate demoting existing current versions to non-current
-            let versions_after = versions_before
-                .clone()
-                .into_iter()
-                .map(|mut version| {
-                    if current_version_ids.contains(&version.id) {
-                        version.current = false;
-                    }
-                    version
-                })
-                .collect::<Vec<_>>();
-
-            // Apply changes to assignments
-            ops.extend(
-                self.subgraph_store
-                    .reconcile_assignments(
-                        &self.logger,
-                        versions_before,
-                        versions_after,
-                        None, // no new assignments will be added
-                    )
-                    .into_iter()
-                    .map(|op| op.into()),
-            );
-
-            // Update subgraph entities to promote pending versions to current
-            for subgraph in subgraphs_to_update {
-                let data = entity! {
-                    id: subgraph.id().unwrap(),
-                    pendingVersion: Value::Null,
-                    currentVersion: subgraph.get("pendingVersion").unwrap().to_owned(),
-                };
-                ops.push(MetadataOperation::Set {
-                    entity: SubgraphEntity::TYPENAME.to_owned(),
-                    id: subgraph.id().unwrap(),
-                    data,
-                });
-            }
-
-            self.subgraph_store
-                .apply_metadata_operations(ops)
-                .map_err(|e| format_err!("Failed to set deployment synced flag: {}", e))
+            self.subgraph_store.deployment_synced(&self.subgraph_id)
         }
     }
 }
@@ -776,22 +562,14 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        // Lock Mutex to perform a state transition
-        let mut state_lock = self.state.lock().unwrap();
-
         let mut state = BlockStreamState::Transition;
-        mem::swap(&mut *state_lock, &mut state);
+        mem::swap(&mut self.state, &mut state);
 
         let result = loop {
             match state {
-                // First time being polled
-                BlockStreamState::New => {
+                BlockStreamState::BeginReconciliation => {
                     // Start the reconciliation process by asking for blocks
-                    let next_blocks_future = self.ctx.next_blocks();
-                    state = BlockStreamState::Reconciliation(next_blocks_future);
-
-                    // Poll the next_blocks() future
-                    continue;
+                    state = BlockStreamState::Reconciliation(self.ctx.next_blocks());
                 }
 
                 // Waiting for the reconciliation to complete or yield blocks
@@ -799,6 +577,21 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
                     match next_blocks_future.poll() {
                         // Reconciliation found blocks to process
                         Ok(Async::Ready(NextBlocks::Blocks(next_blocks, block_range_size))) => {
+                            // We had only one error, so we infer that reducing the range size is
+                            // what fixed it. Reduce the max range size to prevent future errors.
+                            // See: 018c6df4-132f-4acc-8697-a2d64e83a9f0
+                            if self.consecutive_err_count == 1 {
+                                // Reduce the max range size by 10%, but to no less than 10.
+                                self.ctx.max_block_range_size =
+                                    (self.ctx.max_block_range_size * 9 / 10).max(10);
+                                info!(
+                                    self.ctx.logger,
+                                    "Maximum range size reduced to {}",
+                                    self.ctx.max_block_range_size
+                                );
+                            }
+                            self.consecutive_err_count = 0;
+
                             let total_triggers =
                                 next_blocks.iter().map(|b| b.triggers.len()).sum::<usize>();
                             self.ctx.previous_triggers_per_block =
@@ -827,9 +620,9 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
                             continue;
                         }
 
-                        Ok(Async::Ready(NextBlocks::Revert)) => {
-                            state = BlockStreamState::Reconciliation(self.ctx.next_blocks());
-                            break Ok(Async::Ready(Some(BlockStreamEvent::Revert)));
+                        Ok(Async::Ready(NextBlocks::Revert(block))) => {
+                            state = BlockStreamState::BeginReconciliation;
+                            break Ok(Async::Ready(Some(BlockStreamEvent::Revert(block))));
                         }
 
                         Ok(Async::NotReady) => {
@@ -839,6 +632,9 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
                         }
 
                         Err(e) => {
+                            // Reset the block range size in an attempt to recover from the error.
+                            // See also: 018c6df4-132f-4acc-8697-a2d64e83a9f0
+                            self.ctx.previous_block_range_size = 1;
                             self.consecutive_err_count += 1;
 
                             // Pause before trying again
@@ -864,12 +660,7 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
 
                         // Done yielding blocks
                         None => {
-                            // Restart reconciliation until more blocks or done
-                            let next_blocks_future = self.ctx.next_blocks();
-                            state = BlockStreamState::Reconciliation(next_blocks_future);
-
-                            // Poll the next_blocks() future
-                            continue;
+                            state = BlockStreamState::BeginReconciliation;
                         }
                     }
                 }
@@ -877,10 +668,7 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
                 // Pausing after an error, before looking for more blocks
                 BlockStreamState::RetryAfterDelay(mut delay) => match delay.poll() {
                     Ok(Async::Ready(())) | Err(_) => {
-                        state = BlockStreamState::Reconciliation(self.ctx.next_blocks());
-
-                        // Poll the next_blocks() future
-                        continue;
+                        state = BlockStreamState::BeginReconciliation;
                     }
 
                     Ok(Async::NotReady) => {
@@ -894,18 +682,15 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
                     match self.chain_head_update_stream.poll() {
                         // Chain head was updated
                         Ok(Async::Ready(Some(()))) => {
-                            // Start reconciliation process
-                            let next_blocks_future = self.ctx.next_blocks();
-                            state = BlockStreamState::Reconciliation(next_blocks_future);
-
-                            // Poll the next_blocks() future
-                            continue;
+                            state = BlockStreamState::BeginReconciliation;
                         }
 
                         // Chain head update stream ended
                         Ok(Async::Ready(None)) => {
                             // Should not happen
-                            return Err(format_err!("chain head update stream ended unexpectedly"));
+                            return Err(anyhow::anyhow!(
+                                "chain head update stream ended unexpectedly"
+                            ));
                         }
 
                         Ok(Async::NotReady) => {
@@ -917,7 +702,7 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
                         // mpsc channel failed
                         Err(()) => {
                             // Should not happen
-                            return Err(format_err!("chain head update Receiver failed"));
+                            return Err(anyhow::anyhow!("chain head update Receiver failed"));
                         }
                     }
                 }
@@ -928,7 +713,7 @@ impl<S: Store, C: ChainStore> Stream for BlockStream<S, C> {
             }
         };
 
-        *state_lock = state;
+        self.state = state;
 
         result
     }
@@ -1044,4 +829,26 @@ where
             metrics,
         )
     }
+}
+
+// This always returns `false` in a normal build. A test may configure reorg by enabling
+// "test_reorg" fail point with the number of the block that should be reorged.
+fn test_reorg(ptr: EthereumBlockPointer) -> bool {
+    fail_point!("test_reorg", |reorg_at| {
+        use std::str::FromStr;
+
+        static REORGED: std::sync::Once = std::sync::Once::new();
+
+        if REORGED.is_completed() {
+            return false;
+        }
+        let reorg_at = u64::from_str(&reorg_at.unwrap()).unwrap();
+        let should_reorg = ptr.number == reorg_at;
+        if should_reorg {
+            REORGED.call_once(|| {})
+        }
+        should_reorg
+    });
+
+    false
 }

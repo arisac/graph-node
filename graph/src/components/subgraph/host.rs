@@ -1,14 +1,38 @@
+use std::cmp::PartialEq;
 use std::fmt;
 use std::sync::Arc;
 
+use anyhow::Error;
 use async_trait::async_trait;
-use failure::Error;
 use futures::sync::mpsc;
 
 use crate::components::metrics::HistogramVec;
 use crate::components::subgraph::SharedProofOfIndexing;
 use crate::prelude::*;
 use web3::types::{Log, Transaction};
+
+#[derive(Debug)]
+pub enum MappingError {
+    /// A possible reorg was detected while running the mapping.
+    PossibleReorg(anyhow::Error),
+    Unknown(anyhow::Error),
+}
+
+impl From<anyhow::Error> for MappingError {
+    fn from(e: anyhow::Error) -> Self {
+        MappingError::Unknown(e)
+    }
+}
+
+impl MappingError {
+    pub fn context(self, s: String) -> Self {
+        use MappingError::*;
+        match self {
+            PossibleReorg(e) => PossibleReorg(e.context(s)),
+            Unknown(e) => Unknown(e.context(s)),
+        }
+    }
+}
 
 /// Common trait for runtime host implementations.
 #[async_trait]
@@ -31,7 +55,7 @@ pub trait RuntimeHost: Send + Sync + Debug + 'static {
         log: &Arc<Log>,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error>;
+    ) -> Result<BlockState, MappingError>;
 
     /// Process an Ethereum call and return a vector of entity operations
     async fn process_call(
@@ -42,7 +66,7 @@ pub trait RuntimeHost: Send + Sync + Debug + 'static {
         call: &Arc<EthereumCall>,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error>;
+    ) -> Result<BlockState, MappingError>;
 
     /// Process an Ethereum block and return a vector of entity operations
     async fn process_block(
@@ -52,7 +76,11 @@ pub trait RuntimeHost: Send + Sync + Debug + 'static {
         trigger_type: &EthereumBlockTriggerType,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error>;
+    ) -> Result<BlockState, MappingError>;
+
+    /// Block number in which this host was created.
+    /// Returns `None` for static data sources.
+    fn creation_block_number(&self) -> Option<u64>;
 }
 
 pub struct HostMetrics {
@@ -113,7 +141,7 @@ impl HostMetrics {
 }
 
 pub trait RuntimeHostBuilder: Clone + Send + Sync + 'static {
-    type Host: RuntimeHost;
+    type Host: RuntimeHost + PartialEq;
     type Req: 'static + Send;
 
     /// Build a new runtime host for a subgraph data source.

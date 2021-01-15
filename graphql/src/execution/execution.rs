@@ -1,22 +1,25 @@
-use super::cache::QueryCache;
+use super::cache::{QueryBlockCache, QueryCache};
 use crossbeam::atomic::AtomicCell;
-use graph::prelude::CheapClone;
-use graphql_parser::query as q;
-use graphql_parser::schema as s;
+use graph::{
+    data::schema::META_FIELD_NAME,
+    prelude::{s, CheapClone},
+    util::timed_rw_lock::TimedMutex,
+};
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use stable_hash::crypto::SetHasher;
 use stable_hash::prelude::*;
 use stable_hash::utils::stable_hash;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter;
-use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
+use graph::data::graphql::*;
 use graph::data::query::CacheStatus;
 use graph::prelude::*;
 use graph::util::lfu_cache::LfuCache;
 
+use super::QueryHash;
 use crate::introspection::{
     is_introspection_field, INTROSPECTION_DOCUMENT, INTROSPECTION_QUERY_TYPE,
 };
@@ -24,136 +27,6 @@ use crate::prelude::*;
 use crate::query::ast as qast;
 use crate::schema::ast as sast;
 use crate::values::coercion;
-
-type QueryHash = <SetHasher as StableHasher>::Out;
-
-#[derive(Debug)]
-struct CacheByBlock {
-    block: EthereumBlockPointer,
-    max_weight: usize,
-    weight: usize,
-    cache: HashMap<QueryHash, Arc<QueryResult>>,
-}
-
-impl CacheByBlock {
-    fn new(block: EthereumBlockPointer, max_weight: usize) -> Self {
-        CacheByBlock {
-            block,
-            max_weight,
-            weight: 0,
-            cache: HashMap::new(),
-        }
-    }
-
-    /// Returns `true` if the insert was successful or `false` if the cache was full.
-    fn insert(&mut self, key: QueryHash, value: Arc<QueryResult>, weight: usize) -> bool {
-        // We never try to insert errors into this cache, and always resolve some value.
-        assert!(value.errors.is_none());
-        let fits_in_cache = self.weight + weight <= self.max_weight;
-        if fits_in_cache {
-            self.weight += weight;
-            self.cache.insert(key, value);
-        }
-        fits_in_cache
-    }
-}
-
-struct WeightedResult {
-    result: Arc<QueryResult>,
-    weight: usize,
-}
-
-impl CacheWeight for WeightedResult {
-    fn indirect_weight(&self) -> usize {
-        self.weight
-    }
-}
-
-impl Default for WeightedResult {
-    fn default() -> Self {
-        WeightedResult {
-            result: Arc::new(QueryResult::new(Some(q::Value::Null))),
-            weight: 0,
-        }
-    }
-}
-
-/// Organize block caches by network names. Since different networks
-/// will be at different block heights, we need to keep their `CacheByBlock`
-/// separate
-struct QueryBlockCache(Vec<(String, VecDeque<CacheByBlock>)>);
-
-impl QueryBlockCache {
-    fn insert(
-        &mut self,
-        network: &str,
-        block_ptr: EthereumBlockPointer,
-        key: QueryHash,
-        result: Arc<QueryResult>,
-        weight: usize,
-    ) -> bool {
-        // Get or insert the cache for this network.
-        let cache = match self
-            .0
-            .iter_mut()
-            .find(|(n, _)| n == network)
-            .map(|(_, c)| c)
-        {
-            Some(c) => c,
-            None => {
-                self.0.push((network.to_owned(), VecDeque::new()));
-                &mut self.0.last_mut().unwrap().1
-            }
-        };
-
-        // If there is already a cache by the block of this query, just add it there.
-        let mut cache_insert = false;
-        if let Some(cache_by_block) = cache.iter_mut().find(|c| c.block == block_ptr) {
-            cache_insert = cache_by_block.insert(key, result.cheap_clone(), weight);
-        } else if *QUERY_CACHE_BLOCKS > 0 {
-            // We're creating a new `CacheByBlock` if:
-            // - There are none yet, this is the first query being cached, or
-            // - `block_ptr` is of higher or equal number than the most recent block in the cache.
-            // Otherwise this is a historical query that does not belong in
-            // the block cache
-            let should_insert = match cache.iter().next() {
-                None => true,
-                Some(highest) => highest.block.number <= block_ptr.number,
-            };
-
-            if should_insert {
-                if cache.len() == *QUERY_CACHE_BLOCKS {
-                    // At capacity, so pop the oldest block.
-                    cache.pop_back();
-                }
-
-                // Create a new cache by block, insert this entry, and add it to the QUERY_CACHE.
-                let max_weight = *QUERY_CACHE_MAX_MEM / *QUERY_CACHE_BLOCKS;
-                let mut cache_by_block = CacheByBlock::new(block_ptr, max_weight);
-                cache_insert = cache_by_block.insert(key, result.cheap_clone(), weight);
-                cache.push_front(cache_by_block);
-            }
-        }
-        cache_insert
-    }
-
-    fn get(
-        &self,
-        network: &str,
-        block_ptr: &EthereumBlockPointer,
-        key: &QueryHash,
-    ) -> Option<Arc<QueryResult>> {
-        if let Some(cache) = self.0.iter().find(|(n, _)| n == network).map(|(_, c)| c) {
-            // Iterate from the most recent block looking for a block that matches.
-            if let Some(cache_by_block) = cache.iter().find(|c| &c.block == block_ptr) {
-                if let Some(response) = cache_by_block.cache.get(key) {
-                    return Some(response.cheap_clone());
-                }
-            }
-        }
-        None
-    }
-}
 
 lazy_static! {
     // Comma separated subgraph ids to cache queries for.
@@ -172,16 +45,17 @@ lazy_static! {
     // How many blocks per network should be kept in the query cache. When the limit is reached,
     // older blocks are evicted. This should be kept small since a lookup to the cache is O(n) on
     // this value, and the cache memory usage also increases with larger number. Set to 0 to disable
-    // the cache. Defaults to 1.
+    // the cache. Defaults to 2.
     static ref QUERY_CACHE_BLOCKS: usize = {
         std::env::var("GRAPH_QUERY_CACHE_BLOCKS")
-        .unwrap_or("1".to_string())
+        .unwrap_or("2".to_string())
         .parse::<usize>()
         .expect("Invalid value for GRAPH_QUERY_CACHE_BLOCKS environment variable")
     };
 
     /// Maximum total memory to be used by the cache. Each block has a max size of
-    /// `QUERY_CACHE_MAX_MEM` / `QUERY_CACHE_BLOCKS`. The env var is in MB.
+    /// `QUERY_CACHE_MAX_MEM` / (`QUERY_CACHE_BLOCKS` * `GRAPH_QUERY_BLOCK_CACHE_SHARDS`).
+    /// The env var is in MB.
     static ref QUERY_CACHE_MAX_MEM: usize = {
         1_000_000 *
         std::env::var("GRAPH_QUERY_CACHE_MAX_MEM")
@@ -197,16 +71,58 @@ lazy_static! {
         .expect("Invalid value for GRAPH_QUERY_CACHE_STALE_PERIOD environment variable")
     };
 
-    // Cache query results for recent blocks by network.
+    /// In how many shards (mutexes) the query block cache is split.
+    /// Ideally this should divide 256 so that the distribution of queries to shards is even.
+    static ref QUERY_BLOCK_CACHE_SHARDS: u8 = {
+        std::env::var("GRAPH_QUERY_BLOCK_CACHE_SHARDS")
+        .unwrap_or("128".to_string())
+        .parse::<u8>()
+        .expect("Invalid value for GRAPH_QUERY_BLOCK_CACHE_SHARDS environment variable, max is 255")
+    };
+
+
+    // Sharded query results cache for recent blocks by network.
     // The `VecDeque` works as a ring buffer with a capacity of `QUERY_CACHE_BLOCKS`.
-    static ref QUERY_BLOCK_CACHE: RwLock<QueryBlockCache> = RwLock::new(QueryBlockCache(vec![]));
-    static ref QUERY_HERD_CACHE: QueryCache<Arc<QueryResult>> = QueryCache::new();
-    static ref QUERY_LFU_CACHE: Mutex<LfuCache<QueryHash, WeightedResult>> = Mutex::new(LfuCache::new());
+    static ref QUERY_BLOCK_CACHE: Vec<TimedMutex<QueryBlockCache>> = {
+            let shards = *QUERY_BLOCK_CACHE_SHARDS;
+            let blocks = *QUERY_CACHE_BLOCKS;
+
+            // The memory budget is evenly divided among blocks and their shards.
+            let max_weight = *QUERY_CACHE_MAX_MEM / (blocks * shards as usize);
+            let mut caches = Vec::new();
+            for i in 0..shards {
+                let id = format!("query_block_cache_{}", i);
+                caches.push(TimedMutex::new(QueryBlockCache::new(blocks, i, max_weight), id))
+            }
+            caches
+    };
+    static ref QUERY_HERD_CACHE: QueryCache<Arc<QueryResult>> = QueryCache::new("query_herd_cache");
+    static ref QUERY_LFU_CACHE: TimedMutex<LfuCache<QueryHash, WeightedResult>> = TimedMutex::new(LfuCache::new(), "query_lfu_cache");
+}
+
+struct WeightedResult {
+    result: Arc<QueryResult>,
+    weight: usize,
+}
+
+impl CacheWeight for WeightedResult {
+    fn indirect_weight(&self) -> usize {
+        self.weight
+    }
+}
+
+impl Default for WeightedResult {
+    fn default() -> Self {
+        WeightedResult {
+            result: Arc::new(QueryResult::new(BTreeMap::default())),
+            weight: 0,
+        }
+    }
 }
 
 struct HashableQuery<'a> {
     query_schema_id: &'a SubgraphDeploymentId,
-    query_variables: &'a HashMap<q::Name, q::Value>,
+    query_variables: &'a HashMap<String, q::Value>,
     query_fragments: &'a HashMap<String, q::FragmentDefinition>,
     selection_set: &'a q::SelectionSet,
     block_ptr: &'a EthereumBlockPointer,
@@ -266,7 +182,7 @@ fn cache_key(
     // It is very important that all data used for the query is included.
     // Otherwise, incorrect results may be returned.
     let query = HashableQuery {
-        query_schema_id: &ctx.query.schema.id,
+        query_schema_id: ctx.query.schema.id(),
         query_variables: &ctx.query.variables,
         query_fragments: &ctx.query.fragments,
         selection_set,
@@ -295,12 +211,21 @@ where
     /// Max value for `first`.
     pub max_first: u32,
 
+    /// Max value for `skip`
+    pub max_skip: u32,
+
     /// Records whether this was a cache hit, used for logging.
     pub(crate) cache_status: AtomicCell<CacheStatus>,
+
+    pub load_manager: Arc<dyn QueryLoadManager>,
+
+    /// Set if this query is being executed in another resolver and therefore reentering functions
+    /// such as `execute_root_selection_set`.
+    pub nested_resolver: bool,
 }
 
 // Helpers to look for types and fields on both the introspection and regular schemas.
-pub(crate) fn get_named_type(schema: &s::Document, name: &Name) -> Option<s::TypeDefinition> {
+pub(crate) fn get_named_type(schema: &s::Document, name: &String) -> Option<s::TypeDefinition> {
     if name.starts_with("__") {
         sast::get_named_type(&INTROSPECTION_DOCUMENT, name).cloned()
     } else {
@@ -310,13 +235,24 @@ pub(crate) fn get_named_type(schema: &s::Document, name: &Name) -> Option<s::Typ
 
 pub(crate) fn get_field<'a>(
     object_type: impl Into<ObjectOrInterface<'a>>,
-    name: &Name,
+    name: &String,
 ) -> Option<s::Field> {
     if name == "__schema" || name == "__type" {
-        let object_type = sast::get_root_query_type(&INTROSPECTION_DOCUMENT).unwrap();
+        let object_type = *INTROSPECTION_QUERY_TYPE;
         sast::get_field(object_type, name).cloned()
     } else {
         sast::get_field(object_type, name).cloned()
+    }
+}
+
+pub(crate) fn object_or_interface<'a>(
+    schema: &'a s::Document,
+    name: &String,
+) -> Option<ObjectOrInterface<'a>> {
+    if name.starts_with("__") {
+        INTROSPECTION_DOCUMENT.object_or_interface(name)
+    } else {
+        schema.object_or_interface(name)
     }
 }
 
@@ -325,7 +261,8 @@ where
     R: Resolver,
 {
     pub fn as_introspection_context(&self) -> ExecutionContext<IntrospectionResolver> {
-        let introspection_resolver = IntrospectionResolver::new(&self.logger, &self.query.schema);
+        let introspection_resolver =
+            IntrospectionResolver::new(&self.logger, self.query.schema.schema());
 
         ExecutionContext {
             logger: self.logger.cheap_clone(),
@@ -333,7 +270,12 @@ where
             query: self.query.as_introspection_query(),
             deadline: self.deadline,
             max_first: std::u32::MAX,
+            max_skip: std::u32::MAX,
+
+            // `cache_status` and `load_manager` are dead values for the introspection context.
             cache_status: AtomicCell::new(CacheStatus::Miss),
+            load_manager: self.load_manager.cheap_clone(),
+            nested_resolver: self.nested_resolver,
         }
     }
 }
@@ -353,8 +295,9 @@ pub fn execute_root_selection_set_uncached(
         span: selection_set.span.clone(),
         items: Vec::new(),
     };
+    let mut meta_items = Vec::new();
 
-    for (_, fields) in collect_fields(ctx, root_type, iter::once(selection_set), None) {
+    for (_, fields) in collect_fields(ctx, root_type, iter::once(selection_set)) {
         let name = fields[0].name.clone();
         let selections = fields.into_iter().map(|f| q::Selection::Field(f.clone()));
         // See if this is an introspection or data field. We don't worry about
@@ -362,16 +305,19 @@ pub fn execute_root_selection_set_uncached(
         // the data_set SelectionSet
         if is_introspection_field(&name) {
             intro_set.items.extend(selections)
+        } else if &name == META_FIELD_NAME {
+            meta_items.extend(selections)
         } else {
             data_set.items.extend(selections)
         }
     }
 
     // If we are getting regular data, prefetch it from the database
-    let mut values = if data_set.items.is_empty() {
+    let mut values = if data_set.items.is_empty() && meta_items.is_empty() {
         BTreeMap::default()
     } else {
-        let initial_data = ctx.resolver.prefetch(&ctx, selection_set)?;
+        let initial_data = ctx.resolver.prefetch(&ctx, &data_set)?;
+        data_set.items.extend(meta_items);
         execute_selection_set_to_map(&ctx, iter::once(&data_set), root_type, initial_data)?
     };
 
@@ -391,37 +337,38 @@ pub fn execute_root_selection_set_uncached(
 }
 
 /// Executes the root selection set of a query.
-pub fn execute_root_selection_set<R: Resolver>(
-    ctx: &ExecutionContext<R>,
-    selection_set: &q::SelectionSet,
-    root_type: &s::ObjectType,
+pub async fn execute_root_selection_set<R: Resolver>(
+    ctx: Arc<ExecutionContext<R>>,
+    selection_set: Arc<q::SelectionSet>,
+    root_type: Arc<s::ObjectType>,
     block_ptr: Option<EthereumBlockPointer>,
 ) -> Arc<QueryResult> {
     // Cache the cache key to not have to calculate it twice - once for lookup
     // and once for insert.
     let mut key: Option<QueryHash> = None;
 
-    if R::CACHEABLE && (*CACHE_ALL || CACHED_SUBGRAPH_IDS.contains(&ctx.query.schema.id)) {
+    if R::CACHEABLE && (*CACHE_ALL || CACHED_SUBGRAPH_IDS.contains(ctx.query.schema.id())) {
         if let (Some(block_ptr), Some(network)) = (block_ptr, &ctx.query.network) {
             // JSONB and metadata queries use `BLOCK_NUMBER_MAX`. Ignore this case for two reasons:
             // - Metadata queries are not cacheable.
             // - Caching `BLOCK_NUMBER_MAX` would make this cache think all other blocks are old.
             if block_ptr.number != BLOCK_NUMBER_MAX as u64 {
                 // Calculate the hash outside of the lock
-                let cache_key = cache_key(ctx, selection_set, &block_ptr);
+                let cache_key = cache_key(&ctx, &selection_set, &block_ptr);
 
                 // Check if the response is cached, first in the recent blocks cache,
                 // and then in the LfuCache for historical queries
                 // The blocks are used to delimit how long locks need to be held
                 {
-                    let cache = QUERY_BLOCK_CACHE.read().unwrap();
+                    let shard = (cache_key[0] as usize) % QUERY_BLOCK_CACHE.len();
+                    let cache = QUERY_BLOCK_CACHE[shard].lock(&ctx.logger);
                     if let Some(result) = cache.get(network, &block_ptr, &cache_key) {
                         ctx.cache_status.store(CacheStatus::Hit);
                         return result;
                     }
                 }
                 {
-                    let mut cache = QUERY_LFU_CACHE.lock().unwrap();
+                    let mut cache = QUERY_LFU_CACHE.lock(&ctx.logger);
                     if let Some(weighted) = cache.get(&cache_key) {
                         ctx.cache_status.store(CacheStatus::Hit);
                         return weighted.result.cheap_clone();
@@ -432,19 +379,72 @@ pub fn execute_root_selection_set<R: Resolver>(
         }
     }
 
-    let mut herd_hit = true;
-    let mut run_query = || {
-        herd_hit = false;
-        Arc::new(QueryResult::from(execute_root_selection_set_uncached(
-            ctx,
-            selection_set,
-            root_type,
-        )))
+    let execute_ctx = ctx.cheap_clone();
+    let execute_selection_set = selection_set.cheap_clone();
+    let execute_root_type = root_type.cheap_clone();
+    let nested_resolver = ctx.nested_resolver;
+    let run_query = async move {
+        // Limiting the cuncurrent queries prevents increase in resource usage when the DB is
+        // contended and queries start queing up. This semaphore organizes the queueing so that
+        // waiting queries consume few resources.
+        //
+        // Do not request a permit in a nested resolver, since it is already holding a permit and
+        // requesting another could deadlock.
+        let _permit = if !nested_resolver {
+            execute_ctx.load_manager.query_permit().await
+        } else {
+            // Acquire a dummy semaphore.
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+        };
+
+        let logger = execute_ctx.logger.clone();
+        let query_text = execute_ctx.query.query_text.cheap_clone();
+        let variables_text = execute_ctx.query.variables_text.cheap_clone();
+        match graph::spawn_blocking_allow_panic(move || {
+            let mut query_res = QueryResult::from(execute_root_selection_set_uncached(
+                &execute_ctx,
+                &execute_selection_set,
+                &execute_root_type,
+            ));
+
+            // Unwrap: In practice should never fail, but if it does we will catch the panic.
+            execute_ctx.resolver.post_process(&mut query_res).unwrap();
+            query_res.deployment = Some(execute_ctx.query.schema.id().clone());
+            Arc::new(query_res)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let e = e.into_panic();
+                let e = match e
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or(e.downcast_ref::<&'static str>().map(|&s| s))
+                {
+                    Some(e) => e.to_string(),
+                    None => "panic is not a string".to_string(),
+                };
+                error!(
+                    logger,
+                    "panic when processing graphql query";
+                    "panic" => e.to_string(),
+                    "query" => query_text,
+                    "variables" => variables_text,
+                );
+                Arc::new(QueryResult::from(QueryExecutionError::Panic(e)))
+            }
+        }
     };
-    let result = if let Some(key) = key {
-        QUERY_HERD_CACHE.cached_query(key, run_query)
+
+    let (result, herd_hit) = if let Some(key) = key {
+        QUERY_HERD_CACHE
+            .cached_query(key, run_query, &ctx.logger)
+            .await
     } else {
-        run_query()
+        (run_query.await, false)
     };
     if herd_hit {
         ctx.cache_status.store(CacheStatus::Shared);
@@ -460,15 +460,23 @@ pub fn execute_root_selection_set<R: Resolver>(
         (no_cache, key, block_ptr, &ctx.query.network)
     {
         // Calculate the weight outside the lock.
-        let weight = result.data.as_ref().unwrap().weight();
-        let mut cache = QUERY_BLOCK_CACHE.write().unwrap();
+        let weight = result.weight();
+        let shard = (key[0] as usize) % QUERY_BLOCK_CACHE.len();
+        let inserted = QUERY_BLOCK_CACHE[shard].lock(&ctx.logger).insert(
+            network,
+            block_ptr.clone(),
+            key,
+            result.cheap_clone(),
+            weight,
+            ctx.logger.cheap_clone(),
+        );
 
         // Get or insert the cache for this network.
-        if cache.insert(network, block_ptr, key, result.cheap_clone(), weight) {
+        if inserted {
             ctx.cache_status.store(CacheStatus::Insert);
         } else {
             // Results that are too old for the QUERY_BLOCK_CACHE go into the QUERY_LFU_CACHE
-            let mut cache = QUERY_LFU_CACHE.lock().unwrap();
+            let mut cache = QUERY_LFU_CACHE.lock(&ctx.logger);
             cache.evict_with_period(*QUERY_CACHE_MAX_MEM, *QUERY_CACHE_STALE_PERIOD);
             cache.insert(
                 key,
@@ -516,7 +524,7 @@ fn execute_selection_set_to_map<'a>(
     let mut result_map: BTreeMap<String, q::Value> = BTreeMap::new();
 
     // Group fields with the same response key, so we can execute them together
-    let grouped_field_set = collect_fields(ctx, object_type, selection_sets, None);
+    let grouped_field_set = collect_fields(ctx, object_type, selection_sets);
 
     // Gather fields that appear more than once with the same response key.
     let multiple_response_keys = {
@@ -540,64 +548,69 @@ fn execute_selection_set_to_map<'a>(
             _ => (),
         }
 
-        // If the field exists on the object, execute it and add its result to the result map
-        if let Some(ref field) = sast::get_field(object_type, &fields[0].name) {
-            // Check if we have the value already.
-            let field_value = prefetched_object
-                .as_mut()
-                .map(|o| {
-                    // Prefetched objects are associated to `prefetch:response_key`.
-                    if let Some(val) = o.remove(&format!("prefetch:{}", response_key)) {
-                        return Some(val);
-                    }
+        // Unwrap: The query was validated to contain only valid fields.
+        let field = sast::get_field(object_type, &fields[0].name).unwrap();
 
-                    // Scalars and scalar lists are associated to the field name.
-                    // If the field has more than one response key, we have to clone.
-                    match multiple_response_keys.contains(fields[0].name.as_str()) {
-                        false => o.remove(&fields[0].name),
-                        true => o.get(&fields[0].name).cloned(),
-                    }
-                })
-                .flatten();
-            match execute_field(&ctx, object_type, field_value, &fields[0], field, fields) {
-                Ok(v) => {
-                    result_map.insert(response_key.to_owned(), v);
+        // Check if we have the value already.
+        let field_value = prefetched_object
+            .as_mut()
+            .map(|o| {
+                // Prefetched objects are associated to `prefetch:response_key`.
+                if let Some(val) = o.remove(&format!("prefetch:{}", response_key)) {
+                    return Some(val);
                 }
-                Err(mut e) => {
-                    errors.append(&mut e);
+
+                // Scalars and scalar lists are associated to the field name.
+                // If the field has more than one response key, we have to clone.
+                match multiple_response_keys.contains(fields[0].name.as_str()) {
+                    false => o.remove(&fields[0].name),
+                    true => o.get(&fields[0].name).cloned(),
                 }
+            })
+            .flatten();
+        match execute_field(&ctx, object_type, field_value, &fields[0], field, fields) {
+            Ok(v) => {
+                result_map.insert(response_key.to_owned(), v);
             }
-        } else {
-            errors.push(QueryExecutionError::UnknownField(
-                fields[0].position,
-                object_type.name.clone(),
-                fields[0].name.clone(),
-            ))
+            Err(mut e) => {
+                errors.append(&mut e);
+            }
         }
     }
 
-    if errors.is_empty() && !result_map.is_empty() {
+    if errors.is_empty() {
         Ok(result_map)
     } else {
-        if errors.is_empty() {
-            errors.push(QueryExecutionError::EmptySelectionSet(
-                object_type.name.clone(),
-            ));
-        }
         Err(errors)
     }
 }
 
-/// Collects fields from selection sets.
+/// Collects fields from selection sets. Returns a map from response key to fields. There will
+/// typically be a single field for a response key. If there are multiple, the overall execution
+/// logic will effectively merged them into the output for the response key.
 pub fn collect_fields<'a>(
     ctx: &'a ExecutionContext<impl Resolver>,
     object_type: &s::ObjectType,
     selection_sets: impl Iterator<Item = &'a q::SelectionSet>,
-    visited_fragments: Option<HashSet<&'a q::Name>>,
 ) -> IndexMap<&'a String, Vec<&'a q::Field>> {
-    let mut visited_fragments = visited_fragments.unwrap_or_default();
-    let mut grouped_fields: IndexMap<_, Vec<_>> = IndexMap::new();
+    let mut grouped_fields = IndexMap::new();
+    collect_fields_inner(
+        ctx,
+        object_type,
+        selection_sets,
+        &mut HashSet::new(),
+        &mut grouped_fields,
+    );
+    grouped_fields
+}
 
+pub fn collect_fields_inner<'a>(
+    ctx: &'a ExecutionContext<impl Resolver>,
+    object_type: &s::ObjectType,
+    selection_sets: impl Iterator<Item = &'a q::SelectionSet>,
+    visited_fragments: &mut HashSet<&'a String>,
+    output: &mut IndexMap<&'a String, Vec<&'a q::Field>>,
+) {
     for selection_set in selection_sets {
         // Only consider selections that are not skipped and should be included
         let selections = selection_set
@@ -609,58 +622,30 @@ pub fn collect_fields<'a>(
         for selection in selections {
             match selection {
                 q::Selection::Field(ref field) => {
-                    // Obtain the response key for the field
                     let response_key = qast::get_response_key(field);
-
-                    // Create a field group for this response key on demand and
-                    // append the selection field to this group.
-                    grouped_fields.entry(response_key).or_default().push(field);
+                    output.entry(response_key).or_default().push(field);
                 }
 
                 q::Selection::FragmentSpread(spread) => {
                     // Only consider the fragment if it hasn't already been included,
                     // as would be the case if the same fragment spread ...Foo appeared
-                    // twice in the same selection set
-                    if !visited_fragments.contains(&spread.fragment_name) {
-                        visited_fragments.insert(&spread.fragment_name);
-
-                        // Resolve the fragment using its name and, if it applies, collect
-                        // fields for the fragment and group them
-                        ctx.query
-                            .get_fragment(&spread.fragment_name)
-                            .and_then(|fragment| {
-                                // We have a fragment, only pass it on if it applies to the
-                                // current object type
-                                if does_fragment_type_apply(
-                                    ctx,
-                                    object_type,
-                                    &fragment.type_condition,
-                                ) {
-                                    Some(fragment)
-                                } else {
-                                    None
-                                }
-                            })
-                            .map(|fragment| {
-                                // We have a fragment that applies to the current object type,
-                                // collect its fields into response key groups
-                                let fragment_grouped_field_set = collect_fields(
-                                    ctx,
-                                    object_type,
-                                    iter::once(&fragment.selection_set),
-                                    Some(visited_fragments.clone()),
-                                );
-
-                                // Add all items from each fragments group to the field group
-                                // with the corresponding response key
-                                for (response_key, mut fragment_group) in fragment_grouped_field_set
-                                {
-                                    grouped_fields
-                                        .entry(response_key)
-                                        .or_default()
-                                        .append(&mut fragment_group);
-                                }
-                            });
+                    // twice in the same selection set.
+                    //
+                    // Note: This will skip both duplicate fragments and will break cycles,
+                    // so we support fragments even though the GraphQL spec prohibits them.
+                    if visited_fragments.insert(&spread.fragment_name) {
+                        let fragment = ctx.query.get_fragment(&spread.fragment_name);
+                        if does_fragment_type_apply(ctx, object_type, &fragment.type_condition) {
+                            // We have a fragment that applies to the current object type,
+                            // collect fields recursively
+                            collect_fields_inner(
+                                ctx,
+                                object_type,
+                                iter::once(&fragment.selection_set),
+                                visited_fragments,
+                                output,
+                            );
+                        }
                     }
                 }
 
@@ -671,26 +656,18 @@ pub fn collect_fields<'a>(
                     };
 
                     if applies {
-                        let fragment_grouped_field_set = collect_fields(
+                        collect_fields_inner(
                             ctx,
                             object_type,
                             iter::once(&fragment.selection_set),
-                            Some(visited_fragments.clone()),
-                        );
-
-                        for (response_key, mut fragment_group) in fragment_grouped_field_set {
-                            grouped_fields
-                                .entry(response_key)
-                                .or_default()
-                                .append(&mut fragment_group);
-                        }
+                            visited_fragments,
+                            output,
+                        )
                     }
                 }
             };
         }
     }
-
-    grouped_fields
 }
 
 /// Determines whether a fragment is applicable to the given object type.
@@ -703,7 +680,7 @@ fn does_fragment_type_apply(
     let q::TypeCondition::On(ref name) = fragment_type;
 
     // Resolve the type the fragment applies to based on its name
-    let named_type = sast::get_named_type(&ctx.query.schema.document, name);
+    let named_type = sast::get_named_type(ctx.query.schema.document(), name);
 
     match named_type {
         // The fragment applies to the object type if its type is the same object type
@@ -733,7 +710,7 @@ fn execute_field(
     field_definition: &s::Field,
     fields: Vec<&q::Field>,
 ) -> Result<q::Value, Vec<QueryExecutionError>> {
-    coerce_argument_values(ctx, object_type, field)
+    coerce_argument_values(&ctx.query, object_type, field)
         .and_then(|argument_values| {
             resolve_field_value(
                 ctx,
@@ -756,7 +733,7 @@ fn resolve_field_value(
     field: &q::Field,
     field_definition: &s::Field,
     field_type: &s::Type,
-    argument_values: &HashMap<&q::Name, q::Value>,
+    argument_values: &HashMap<&String, q::Value>,
 ) -> Result<q::Value, Vec<QueryExecutionError>> {
     match field_type {
         s::Type::NonNullType(inner_type) => resolve_field_value(
@@ -798,11 +775,11 @@ fn resolve_field_value_for_named_type(
     field_value: Option<q::Value>,
     field: &q::Field,
     field_definition: &s::Field,
-    type_name: &s::Name,
-    argument_values: &HashMap<&q::Name, q::Value>,
+    type_name: &String,
+    argument_values: &HashMap<&String, q::Value>,
 ) -> Result<q::Value, Vec<QueryExecutionError>> {
     // Try to resolve the type name into the actual type
-    let named_type = sast::get_named_type(&ctx.query.schema.document, type_name)
+    let named_type = sast::get_named_type(ctx.query.schema.document(), type_name)
         .ok_or_else(|| QueryExecutionError::NamedTypeError(type_name.to_string()))?;
     match named_type {
         // Let the resolver decide how the field (with the given object type) is resolved
@@ -848,7 +825,7 @@ fn resolve_field_value_for_list_type(
     field: &q::Field,
     field_definition: &s::Field,
     inner_type: &s::Type,
-    argument_values: &HashMap<&q::Name, q::Value>,
+    argument_values: &HashMap<&String, q::Value>,
 ) -> Result<q::Value, Vec<QueryExecutionError>> {
     match inner_type {
         s::Type::NonNullType(inner_type) => resolve_field_value_for_list_type(
@@ -862,7 +839,7 @@ fn resolve_field_value_for_list_type(
         ),
 
         s::Type::NamedType(ref type_name) => {
-            let named_type = sast::get_named_type(&ctx.query.schema.document, type_name)
+            let named_type = sast::get_named_type(ctx.query.schema.document(), type_name)
                 .ok_or_else(|| QueryExecutionError::NamedTypeError(type_name.to_string()))?;
 
             match named_type {
@@ -978,7 +955,7 @@ fn complete_value(
         }
 
         s::Type::NamedType(name) => {
-            let named_type = sast::get_named_type(&ctx.query.schema.document, name).unwrap();
+            let named_type = sast::get_named_type(ctx.query.schema.document(), name).unwrap();
 
             match named_type {
                 // Complete scalar values
@@ -1059,7 +1036,7 @@ fn resolve_abstract_type<'a>(
     // Let the resolver handle the type resolution, return an error if the resolution
     // yields nothing
     ctx.resolver
-        .resolve_abstract_type(&ctx.query.schema.document, abstract_type, object_value)
+        .resolve_abstract_type(ctx.query.schema.document(), abstract_type, object_value)
         .ok_or_else(|| {
             vec![QueryExecutionError::AbstractTypeError(
                 sast::get_type_name(abstract_type).to_string(),
@@ -1069,21 +1046,21 @@ fn resolve_abstract_type<'a>(
 
 /// Coerces argument values into GraphQL values.
 pub fn coerce_argument_values<'a>(
-    ctx: &ExecutionContext<impl Resolver>,
-    object_type: &'a s::ObjectType,
+    query: &crate::execution::Query,
+    ty: impl Into<ObjectOrInterface<'a>>,
     field: &q::Field,
-) -> Result<HashMap<&'a q::Name, q::Value>, Vec<QueryExecutionError>> {
+) -> Result<HashMap<&'a String, q::Value>, Vec<QueryExecutionError>> {
     let mut coerced_values = HashMap::new();
     let mut errors = vec![];
 
-    let resolver = |name: &Name| sast::get_named_type(&ctx.query.schema.document, name);
+    let resolver = |name: &String| sast::get_named_type(&query.schema.document(), name);
 
-    for argument_def in sast::get_argument_definitions(object_type, &field.name)
+    for argument_def in sast::get_argument_definitions(ty, &field.name)
         .into_iter()
         .flatten()
     {
         let value = qast::get_argument_value(&field.arguments, &argument_def.name).cloned();
-        match coercion::coerce_input_value(value, &argument_def, &resolver, &ctx.query.variables) {
+        match coercion::coerce_input_value(value, &argument_def, &resolver, &query.variables) {
             Ok(Some(value)) => {
                 if argument_def.name == "text".to_string() {
                     coerced_values.insert(
