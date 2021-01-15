@@ -1,12 +1,13 @@
+use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use anyhow::ensure;
 use async_trait::async_trait;
 use ethabi::{LogParam, RawLog};
 use futures::sync::mpsc::Sender;
 use futures03::channel::oneshot::channel;
+use graph::ensure;
 use semver::{Version, VersionReq};
 use slog::{o, OwnedKV};
 use strum::AsStaticRef as _;
@@ -15,7 +16,7 @@ use tiny_keccak::keccak256;
 use graph::components::arweave::ArweaveAdapter;
 use graph::components::ethereum::*;
 use graph::components::store::Store;
-use graph::components::subgraph::SharedProofOfIndexing;
+use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
 use graph::components::three_box::ThreeBoxAdapter;
 use graph::data::subgraph::{Mapping, Source};
 use graph::prelude::{
@@ -27,7 +28,14 @@ use web3::types::{Log, Transaction};
 use crate::host_exports::HostExports;
 use crate::mapping::{MappingContext, MappingRequest, MappingTrigger};
 
-pub(crate) const TIMEOUT_ENV_VAR: &str = "GRAPH_MAPPING_HANDLER_TIMEOUT";
+lazy_static! {
+    static ref TIMEOUT: Option<Duration> = std::env::var("GRAPH_MAPPING_HANDLER_TIMEOUT")
+        .ok()
+        .map(|s| u64::from_str(&s).expect("Invalid value for GRAPH_MAPPING_HANDLER_TIMEOUT"))
+        .map(Duration::from_secs);
+    static ref ALLOW_NON_DETERMINISTIC_IPFS: bool =
+        std::env::var("GRAPH_ALLOW_NON_DETERMINISTIC_IPFS").is_ok();
+}
 
 struct RuntimeHostConfig {
     subgraph_id: SubgraphDeploymentId,
@@ -35,6 +43,7 @@ struct RuntimeHostConfig {
     data_source_network: String,
     data_source_name: String,
     data_source_context: Option<DataSourceContext>,
+    data_source_creation_block: Option<u64>,
     contract: Source,
     templates: Arc<Vec<DataSourceTemplate>>,
 }
@@ -64,7 +73,7 @@ where
 
 impl<S> RuntimeHostBuilder<S>
 where
-    S: Store + SubgraphDeploymentStore + EthereumCallCache,
+    S: Store + EthereumCallCache,
 {
     pub fn new(
         ethereum_networks: EthereumNetworks,
@@ -85,7 +94,7 @@ where
 
 impl<S> RuntimeHostBuilderTrait for RuntimeHostBuilder<S>
 where
-    S: Send + Sync + 'static + Store + SubgraphDeploymentStore + EthereumCallCache,
+    S: Send + Sync + 'static + Store + EthereumCallCache,
 {
     type Host = RuntimeHost;
     type Req = MappingRequest;
@@ -95,19 +104,15 @@ where
         logger: Logger,
         subgraph_id: SubgraphDeploymentId,
         metrics: Arc<HostMetrics>,
-    ) -> Result<Sender<Self::Req>, anyhow::Error> {
-        let timeout = std::env::var(TIMEOUT_ENV_VAR)
-            .ok()
-            .and_then(|s| u64::from_str(&s).ok())
-            .map(Duration::from_secs);
-
+    ) -> Result<Sender<Self::Req>, Error> {
         crate::mapping::spawn_module(
             raw_module,
             logger,
             subgraph_id,
             metrics,
             tokio::runtime::Handle::current(),
-            timeout,
+            *TIMEOUT,
+            *ALLOW_NON_DETERMINISTIC_IPFS,
         )
     }
 
@@ -116,12 +121,12 @@ where
         network_name: String,
         subgraph_id: SubgraphDeploymentId,
         data_source: DataSource,
-        top_level_templates: Arc<Vec<DataSourceTemplate>>,
+        templates: Arc<Vec<DataSourceTemplate>>,
         mapping_request_sender: Sender<MappingRequest>,
         metrics: Arc<HostMetrics>,
     ) -> Result<Self::Host, Error> {
         let store = self.stores.get(&network_name).ok_or_else(|| {
-            format_err!(
+            anyhow!(
                 "No store found that matches subgraph network: \"{}\"",
                 &network_name
             )
@@ -132,13 +137,6 @@ where
         let ethereum_adapter = self
             .ethereum_networks
             .adapter_with_capabilities(network_name.clone(), &required_capabilities)?;
-
-        // Detect whether the subgraph uses templates in data sources, which are
-        // deprecated, or the top-level templates field.
-        let templates = match top_level_templates.is_empty() {
-            false => top_level_templates,
-            true => Arc::new(data_source.templates),
-        };
 
         RuntimeHost::new(
             ethereum_adapter.clone(),
@@ -151,6 +149,7 @@ where
                 data_source_network: network_name,
                 data_source_name: data_source.name,
                 data_source_context: data_source.context,
+                data_source_creation_block: data_source.creation_block,
                 contract: data_source.source,
                 templates,
             },
@@ -170,6 +169,7 @@ pub struct RuntimeHost {
     data_source_event_handlers: Vec<MappingEventHandler>,
     data_source_call_handlers: Vec<MappingCallHandler>,
     data_source_block_handlers: Vec<MappingBlockHandler>,
+    data_source_creation_block: Option<u64>,
     mapping_request_sender: Sender<MappingRequest>,
     host_exports: Arc<HostExports>,
     metrics: Arc<HostMetrics>,
@@ -189,7 +189,7 @@ impl RuntimeHost {
     ) -> Result<Self, Error> {
         let api_version = Version::parse(&config.mapping.api_version)?;
         if !VersionReq::parse("<= 0.0.4").unwrap().matches(&api_version) {
-            return Err(format_err!(
+            return Err(anyhow!(
                 "This Graph Node only supports mapping API versions <= 0.0.4, but subgraph `{}` uses `{}`",
                 config.subgraph_id,
                 api_version
@@ -202,7 +202,7 @@ impl RuntimeHost {
             .iter()
             .find(|abi| abi.name == config.contract.abi)
             .ok_or_else(|| {
-                format_err!(
+                anyhow!(
                     "No ABI entry found for the main contract of data source \"{}\": {}",
                     &config.data_source_name,
                     config.contract.abi,
@@ -238,6 +238,7 @@ impl RuntimeHost {
             data_source_event_handlers: config.mapping.event_handlers,
             data_source_call_handlers: config.mapping.call_handlers,
             data_source_block_handlers: config.mapping.block_handlers,
+            data_source_creation_block: config.data_source_creation_block,
             mapping_request_sender,
             host_exports,
             metrics,
@@ -315,7 +316,7 @@ impl RuntimeHost {
         Ok(handlers)
     }
 
-    fn handler_for_call(&self, call: &EthereumCall) -> Result<MappingCallHandler, anyhow::Error> {
+    fn handler_for_call(&self, call: &EthereumCall) -> Result<MappingCallHandler, Error> {
         // First four bytes of the input for the call are the first four
         // bytes of hash of the function signature
         ensure!(
@@ -334,7 +335,7 @@ impl RuntimeHost {
             })
             .cloned()
             .with_context(|| {
-                format_err!(
+                anyhow!(
                     "No call handler found for call in data source \"{}\"",
                     self.data_source_name,
                 )
@@ -352,7 +353,7 @@ impl RuntimeHost {
                 .find(move |handler| handler.filter == None)
                 .cloned()
                 .with_context(|| {
-                    format_err!(
+                    anyhow!(
                         "No block handler for `Every` block trigger \
                          type found in data source \"{}\"",
                         self.data_source_name,
@@ -367,7 +368,7 @@ impl RuntimeHost {
                 })
                 .cloned()
                 .with_context(|| {
-                    format_err!(
+                    anyhow!(
                         "No block handler for `WithCallTo` block trigger \
                          type found in data source \"{}\"",
                         self.data_source_name,
@@ -387,7 +388,7 @@ impl RuntimeHost {
         trigger: MappingTrigger,
         block: &Arc<LightEthereumBlock>,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error> {
+    ) -> Result<BlockState, MappingError> {
         let trigger_type = trigger.as_static();
         debug!(
             logger, "Start processing Ethereum trigger";
@@ -478,7 +479,7 @@ impl RuntimeHostTrait for RuntimeHost {
         call: &Arc<EthereumCall>,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error> {
+    ) -> Result<BlockState, MappingError> {
         // Identify the call handler for this call
         let call_handler = self.handler_for_call(&call)?;
 
@@ -488,7 +489,7 @@ impl RuntimeHostTrait for RuntimeHost {
             call_handler.function.as_str(),
         )
         .with_context(|| {
-            format_err!(
+            anyhow!(
                 "Function with the signature \"{}\" not found in \
                     contract \"{}\" of data source \"{}\"",
                 call_handler.function,
@@ -585,7 +586,7 @@ impl RuntimeHostTrait for RuntimeHost {
         trigger_type: &EthereumBlockTriggerType,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error> {
+    ) -> Result<BlockState, MappingError> {
         let block_handler = self.handler_for_block(trigger_type)?;
         self.send_mapping_request(
             logger,
@@ -612,7 +613,7 @@ impl RuntimeHostTrait for RuntimeHost {
         log: &Arc<Log>,
         state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, anyhow::Error> {
+    ) -> Result<BlockState, MappingError> {
         let data_source_name = &self.data_source_name;
         let abi_name = &self.data_source_contract_abi.name;
         let contract = &self.data_source_contract_abi.contract;
@@ -631,7 +632,7 @@ impl RuntimeHostTrait for RuntimeHost {
                     event_handler.event.as_str(),
                 )
                 .with_context(|| {
-                    format_err!(
+                    anyhow!(
                         "Event with the signature \"{}\" not found in \
                                 contract \"{}\" of data source \"{}\"",
                         event_handler.event,
@@ -715,6 +716,41 @@ impl RuntimeHostTrait for RuntimeHost {
             block,
             proof_of_indexing,
         )
+        .err_into()
         .await
+    }
+
+    fn creation_block_number(&self) -> Option<u64> {
+        self.data_source_creation_block
+    }
+}
+
+impl PartialEq for RuntimeHost {
+    fn eq(&self, other: &Self) -> bool {
+        let RuntimeHost {
+            data_source_name,
+            data_source_contract,
+            data_source_contract_abi,
+            data_source_event_handlers,
+            data_source_call_handlers,
+            data_source_block_handlers,
+            host_exports,
+
+            // The creation block is ignored for detection duplicate data sources.
+            data_source_creation_block: _,
+            mapping_request_sender: _,
+            metrics: _,
+        } = self;
+
+        // mapping_request_sender, host_metrics, and (most of) host_exports are operational structs
+        // used at runtime but not needed to define uniqueness; each runtime host should be for a
+        // unique data source.
+        data_source_name == &other.data_source_name
+            && data_source_contract == &other.data_source_contract
+            && data_source_contract_abi == &other.data_source_contract_abi
+            && data_source_event_handlers == &other.data_source_event_handlers
+            && data_source_call_handlers == &other.data_source_call_handlers
+            && data_source_block_handlers == &other.data_source_block_handlers
+            && host_exports.data_source_context() == other.host_exports.data_source_context()
     }
 }
