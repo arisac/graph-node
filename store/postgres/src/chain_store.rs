@@ -148,6 +148,12 @@ impl ChainStoreTrait for ChainStore {
                 data.eq(json_blob),
             );
 
+            info!(
+                self.logger,
+                "upsert_blocks ......start",
+                values,
+            );
+
             // Insert blocks.
             //
             // If the table already contains a block with the same hash, then overwrite that block
@@ -161,6 +167,12 @@ impl ChainStoreTrait for ChainStore {
                 .map_err(Error::from)
                 .map_err(E::from)
                 .map(|_| ())
+
+
+            info!(
+                self.logger,
+                "upsert_blocks ......end",
+            ); 
         }))
     }
 

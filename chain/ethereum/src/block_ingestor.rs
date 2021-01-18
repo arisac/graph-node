@@ -198,7 +198,11 @@ where
         // ingest_blocks will return a (potentially incomplete) list of blocks that are
         // missing.
         let mut missing_block_hashes = self.ingest_blocks(stream::once(Ok(latest_block))).await?;
-
+        info!(
+            self.logger,
+            "missing_block_hashes",
+            missing_block_hashes,             
+        );
         // Repeatedly fetch missing parent blocks, and ingest them.
         // ingest_blocks will continue to tell us about more missing parent
         // blocks until we have filled in all missing pieces of the
@@ -218,6 +222,10 @@ where
         //   iteration will have at most block number N-1.
         // - Therefore, the loop will iterate at most ancestor_count times.
         while !missing_block_hashes.is_empty() {
+            info!(
+                self.logger,
+                "while ......",
+            );
             // Some blocks are missing: load them, ingest them, and repeat.
             let missing_blocks = self.get_blocks(&missing_block_hashes);
             missing_block_hashes = self.ingest_blocks(missing_blocks).await?;
@@ -234,7 +242,19 @@ where
         &self,
         blocks: B,
     ) -> Result<Vec<H256>, EthereumAdapterError> {
+        info!(
+            self.logger,
+            "ingest_blocks ......start",
+            blocks,
+        );
+
         self.chain_store.upsert_blocks(blocks).compat().await?;
+
+        info!(
+            self.logger,
+            "ingest_blocks ......ancestor_count",
+            self.ancestor_count
+        );
 
         self.chain_store
             .attempt_chain_head_update(self.ancestor_count)
@@ -242,6 +262,12 @@ where
                 error!(self.logger, "failed to update chain head");
                 EthereumAdapterError::Unknown(e)
             })
+
+        info!(
+            self.logger,
+            "ingest_blocks ......end",
+            blocks,
+        );
     }
 
     /// Requests the specified blocks via web3, returning them in a stream (potentially out of
@@ -252,7 +278,11 @@ where
     ) -> Box<dyn Stream<Item = EthereumBlock, Error = EthereumAdapterError> + Send + 'static> {
         let logger = self.logger.clone();
         let eth_adapter = self.eth_adapter.clone();
-
+        info!(
+            self.logger,
+            "get_blocks ......start",
+            block_hashes,
+        );
         let block_futures = block_hashes.iter().map(move |&block_hash| {
             let logger = logger.clone();
             let eth_adapter = eth_adapter.clone();
@@ -265,7 +295,10 @@ where
                 })
                 .and_then(move |block| eth_adapter.load_full_block(&logger, block))
         });
-
+        info!(
+            self.logger,
+            "get_blocks ...... end",
+        );
         Box::new(stream::futures_unordered(block_futures))
     }
 }
