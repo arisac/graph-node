@@ -102,6 +102,12 @@ where
                 Ok(()) => (),
             }
 
+            info!(
+                self.logger,
+                "======= do_poll done, CLEANUP_BLOCKS:{}",
+                *CLEANUP_BLOCKS
+            );
+
             if *CLEANUP_BLOCKS {
                 self.cleanup_cached_blocks()
             }
