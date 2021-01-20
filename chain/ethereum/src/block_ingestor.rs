@@ -104,15 +104,11 @@ where
 
             info!(
                 self.logger,
-                "do_poll done ...{}",
+                "======= do_poll done, CLEANUP_BLOCKS:{}",
                 *CLEANUP_BLOCKS
             );
 
             if *CLEANUP_BLOCKS {
-                info!(
-                    self.logger,
-                    "cleanup_cached_blocks"
-                );
                 self.cleanup_cached_blocks()
             }
 
@@ -203,11 +199,6 @@ where
             .compat()
             .await?;
 
-        info!(
-            self.logger,
-            "latest_block missing_block_hashes:"
-        );
-
         // Store latest block in block store.
         // Might be a no-op if latest block is one that we have seen.
         // ingest_blocks will return a (potentially incomplete) list of blocks that are
@@ -274,11 +265,6 @@ where
                 error!(self.logger, "failed to update chain head");
                 EthereumAdapterError::Unknown(e)
             })
-
-        info!(
-            self.logger,
-            "ingest_blocks ......end",
-        );
     }
 
     /// Requests the specified blocks via web3, returning them in a stream (potentially out of
