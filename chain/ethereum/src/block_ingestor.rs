@@ -102,7 +102,17 @@ where
                 Ok(()) => (),
             }
 
+            info!(
+                self.logger,
+                "do_poll done ...{}",
+                *CLEANUP_BLOCKS
+            );
+
             if *CLEANUP_BLOCKS {
+                info!(
+                    self.logger,
+                    "cleanup_cached_blocks"
+                );
                 self.cleanup_cached_blocks()
             }
 
@@ -193,16 +203,17 @@ where
             .compat()
             .await?;
 
+        info!(
+            self.logger,
+            "latest_block missing_block_hashes:"
+        );
+
         // Store latest block in block store.
         // Might be a no-op if latest block is one that we have seen.
         // ingest_blocks will return a (potentially incomplete) list of blocks that are
         // missing.
         let mut missing_block_hashes = self.ingest_blocks(stream::once(Ok(latest_block))).await?;
-        info!(
-            self.logger,
-            "missing_block_hashes",
-            missing_block_hashes,             
-        );
+
         // Repeatedly fetch missing parent blocks, and ingest them.
         // ingest_blocks will continue to tell us about more missing parent
         // blocks until we have filled in all missing pieces of the
@@ -224,12 +235,14 @@ where
         while !missing_block_hashes.is_empty() {
             info!(
                 self.logger,
-                "while ......",
+                "missing_block_hashes while ......",
             );
             // Some blocks are missing: load them, ingest them, and repeat.
             let missing_blocks = self.get_blocks(&missing_block_hashes);
             missing_block_hashes = self.ingest_blocks(missing_blocks).await?;
         }
+
+        info!(self.logger, "completed while");
         Ok(())
     }
 
@@ -245,14 +258,13 @@ where
         info!(
             self.logger,
             "ingest_blocks ......start",
-            blocks,
         );
 
         self.chain_store.upsert_blocks(blocks).compat().await?;
 
         info!(
             self.logger,
-            "ingest_blocks ......ancestor_count",
+            "ingest_blocks ......attempt_chain_head_update({}):",
             self.ancestor_count
         );
 
@@ -266,7 +278,6 @@ where
         info!(
             self.logger,
             "ingest_blocks ......end",
-            blocks,
         );
     }
 
@@ -280,8 +291,8 @@ where
         let eth_adapter = self.eth_adapter.clone();
         info!(
             self.logger,
-            "get_blocks ......start",
-            block_hashes,
+            "get_blocks ......start {}",
+            block_hashes.len()
         );
         let block_futures = block_hashes.iter().map(move |&block_hash| {
             let logger = logger.clone();

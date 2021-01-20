@@ -150,8 +150,8 @@ impl ChainStoreTrait for ChainStore {
 
             info!(
                 self.logger,
-                "upsert_blocks ......start",
-                values,
+                "upsert_blocks ......start number{}",
+                block.block.number
             );
 
             // Insert blocks.
